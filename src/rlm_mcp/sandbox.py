@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -151,14 +152,30 @@ class SandboxExecutor:
     def __init__(
         self,
         *,
+        sandbox_mode: str | None = None,
         memory_limit_mb: int = 256,
         max_open_files: int = 32,
         max_output_chars: int = 200_000,
         allowed_import_roots: tuple[str, ...] | None = None,
+        fallback_to_subprocess: bool = True,
+        container_runtime: str | None = None,
+        container_image: str | None = None,
+        container_pids_limit: int = 128,
+        container_tmpfs_size_mb: int = 32,
     ) -> None:
+        mode = (sandbox_mode or os.getenv("RLM_SANDBOX_MODE", "subprocess")).strip().lower()
+        if mode not in {"subprocess", "container"}:
+            raise ValueError("sandbox_mode must be 'subprocess' or 'container'")
+
+        self.sandbox_mode = mode
         self.memory_limit_mb = memory_limit_mb
         self.max_open_files = max_open_files
         self.max_output_chars = max_output_chars
+        self.fallback_to_subprocess = fallback_to_subprocess
+        self.container_runtime = (container_runtime or os.getenv("RLM_SANDBOX_CONTAINER_RUNTIME", "docker")).strip()
+        self.container_image = (container_image or os.getenv("RLM_SANDBOX_CONTAINER_IMAGE", "python:3.12-alpine")).strip()
+        self.container_pids_limit = max(32, container_pids_limit)
+        self.container_tmpfs_size_mb = max(8, container_tmpfs_size_mb)
         self.allowed_import_roots = allowed_import_roots or (
             "math",
             "statistics",
@@ -182,9 +199,72 @@ class SandboxExecutor:
             "allowed_import_roots": list(self.allowed_import_roots),
         }
 
+        if self.sandbox_mode == "container":
+            container_cmd = self._build_container_command()
+            result, updates = self._execute_worker(container_cmd, payload, timeout_ms=timeout_ms, timeout_label="container")
+            if result.error and self.fallback_to_subprocess and self._is_runtime_missing_error(result.error):
+                result, updates = self._execute_worker(
+                    self._build_subprocess_command(),
+                    payload,
+                    timeout_ms=timeout_ms,
+                    timeout_label="subprocess",
+                )
+        else:
+            result, updates = self._execute_worker(
+                self._build_subprocess_command(),
+                payload,
+                timeout_ms=timeout_ms,
+                timeout_label="subprocess",
+            )
+
+        self._apply_env_updates(env, updates)
+        return result
+
+    def _build_subprocess_command(self) -> list[str]:
+        return [sys.executable, "-I", "-S", "-c", _WORKER_CODE]
+
+    def _build_container_command(self) -> list[str]:
+        return [
+            self.container_runtime,
+            "run",
+            "--rm",
+            "-i",
+            "--network",
+            "none",
+            "--read-only",
+            "--pids-limit",
+            str(self.container_pids_limit),
+            "--memory",
+            f"{self.memory_limit_mb}m",
+            "--cpus",
+            "1.0",
+            "--security-opt",
+            "no-new-privileges",
+            "--cap-drop",
+            "ALL",
+            "--tmpfs",
+            f"/tmp:rw,noexec,nosuid,size={self.container_tmpfs_size_mb}m",
+            "--user",
+            "65532:65532",
+            self.container_image,
+            "python",
+            "-I",
+            "-S",
+            "-c",
+            _WORKER_CODE,
+        ]
+
+    def _execute_worker(
+        self,
+        command: list[str],
+        payload: dict[str, Any],
+        *,
+        timeout_ms: int,
+        timeout_label: str,
+    ) -> tuple[SandboxResult, dict[str, Any]]:
         try:
             proc = subprocess.Popen(
-                [sys.executable, "-I", "-S", "-c", _WORKER_CODE],
+                command,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -197,18 +277,21 @@ class SandboxExecutor:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate()
-            error = "TimeoutError: sandbox subprocess timed out"
-            return SandboxResult(stdout="", stderr=error + "\n", error=error)
+            error = f"TimeoutError: sandbox {timeout_label} timed out"
+            return SandboxResult(stdout="", stderr=error + "\n", error=error), {}
         except Exception as exc:  # pragma: no cover
             error = f"SandboxProcessError: {type(exc).__name__}: {exc}"
-            return SandboxResult(stdout="", stderr=error + "\n", error=error)
+            return SandboxResult(stdout="", stderr=error + "\n", error=error), {}
 
         if proc.returncode != 0:
-            error = f"SandboxProcessError: subprocess exited with code {proc.returncode}"
+            if proc.returncode < 0 and abs(proc.returncode) in {9, 24, 25}:
+                error = f"TimeoutError: sandbox {timeout_label} exceeded execution limits"
+                return SandboxResult(stdout="", stderr=error + "\n", error=error), {}
+            error = f"SandboxProcessError: {timeout_label} exited with code {proc.returncode}"
             detail = (stderr or "").strip()
             if detail:
                 error = f"{error}: {detail}"
-            return SandboxResult(stdout="", stderr=error + "\n", error=error)
+            return SandboxResult(stdout="", stderr=error + "\n", error=error), {}
 
         try:
             result = json.loads(stdout)
@@ -217,17 +300,28 @@ class SandboxExecutor:
             detail = (stderr or "").strip()
             if detail:
                 error = f"{error}: {detail}"
-            return SandboxResult(stdout="", stderr=error + "\n", error=error)
+            return SandboxResult(stdout="", stderr=error + "\n", error=error), {}
 
-        new_env = result.get("env", {})
-        for key, value in new_env.items():
+        updates = result.get("env", {})
+        if not isinstance(updates, dict):
+            updates = {}
+
+        return (
+            SandboxResult(
+                stdout=result.get("stdout", ""),
+                stderr=result.get("stderr", ""),
+                error=result.get("error"),
+            ),
+            updates,
+        )
+
+    def _apply_env_updates(self, env: dict[str, Any], updates: dict[str, Any]) -> None:
+        for key, value in updates.items():
             env[key] = self._decode_value(value)
 
-        return SandboxResult(
-            stdout=result.get("stdout", ""),
-            stderr=result.get("stderr", ""),
-            error=result.get("error"),
-        )
+    @staticmethod
+    def _is_runtime_missing_error(error: str) -> bool:
+        return "FileNotFoundError" in error or "No such file or directory" in error
 
     @staticmethod
     def _encode_value(value: Any) -> Any:

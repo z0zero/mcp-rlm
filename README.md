@@ -114,6 +114,30 @@ Guardrail aktif di service:
 
 Jika terlampaui, sesi berhenti dengan reason code (contoh: `max_steps`, `timeout`, `budget_exceeded`).
 
+## Production Sandbox Mode (Container)
+
+Default saat ini memakai subprocess terisolasi. Untuk production, aktifkan mode container:
+
+```bash
+export RLM_SANDBOX_MODE=container
+export RLM_SANDBOX_CONTAINER_RUNTIME=docker
+export RLM_SANDBOX_CONTAINER_IMAGE=python:3.12-alpine
+```
+
+Rekomendasi:
+- Set `RLM_SANDBOX_MODE=container` di environment service yang menjalankan MCP server.
+- Pastikan image sandbox tersedia di host/container registry.
+- Secara default sandbox container dijalankan dengan:
+  - `--network none`
+  - `--read-only`
+  - `--cap-drop ALL`
+  - `--security-opt no-new-privileges`
+  - `--pids-limit` + memory/cpu limit + tmpfs terbatas.
+
+Catatan:
+- Jika runtime container tidak tersedia, executor akan fallback ke mode subprocess (untuk local/dev compatibility).
+- Untuk lingkungan production ketat, nonaktifkan fallback di level konfigurasi aplikasi (next hardening step).
+
 ## Cara Pakai Di Codex (Contoh Alur)
 
 ### 1) Inisialisasi context panjang
