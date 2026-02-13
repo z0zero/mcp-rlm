@@ -4,6 +4,8 @@ import json
 from enum import Enum
 from typing import Any, Callable
 
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
 from rlm_mcp.errors import RlmMcpError
 from rlm_mcp.models import SessionConfig
 from rlm_mcp.service import RlmMcpService
@@ -69,6 +71,56 @@ class ResponseFormat(str, Enum):
     MARKDOWN = "markdown"
 
 
+class InitContextInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    context_text: str = Field(..., min_length=1, description="Long context to load into in-memory session state.")
+    max_steps: int = Field(default=64, ge=1, le=10_000)
+    max_runtime_ms: int = Field(default=120_000, ge=1_000, le=3_600_000)
+    budget_limit: int = Field(default=100_000, ge=1_000, le=10_000_000)
+    response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
+
+
+class RunReplInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    session_id: str = Field(..., min_length=1, description="Session id from rlm_init_context.")
+    code: str = Field(..., min_length=1, max_length=50_000, description="Python code snippet to execute.")
+    response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
+
+
+class GetVarInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    session_id: str = Field(..., min_length=1)
+    var_name: str = Field(..., min_length=1, max_length=256)
+    response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
+
+
+class FinalizeInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    session_id: str = Field(..., min_length=1)
+    final_text: str | None = Field(default=None)
+    final_var_name: str | None = Field(default=None, min_length=1, max_length=256)
+    response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
+
+    @model_validator(mode="after")
+    def validate_finalize_payload(self) -> "FinalizeInput":
+        if self.final_text is None and self.final_var_name is None:
+            raise ValueError("either final_text or final_var_name must be provided")
+        return self
+
+
+class GetTraceInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    session_id: str = Field(..., min_length=1)
+    from_step: int | None = Field(default=None, ge=0)
+    to_step: int | None = Field(default=None, ge=0)
+    response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
+
+
 def _as_markdown(data: Any) -> str:
     if isinstance(data, str):
         return data
@@ -121,56 +173,10 @@ def build_mcp_app(service: RlmMcpService | None = None) -> Any:
     """Build FastMCP app lazily so non-MCP tests can run without SDK installed."""
     try:
         from mcp.server.fastmcp import FastMCP
-        from pydantic import BaseModel, ConfigDict, Field, model_validator
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "MCP SDK is not installed. Install dependencies first: `python -m pip install -e .`."
         ) from exc
-
-    class InitContextInput(BaseModel):
-        model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-        context_text: str = Field(..., min_length=1, description="Long context to load into in-memory session state.")
-        max_steps: int = Field(default=64, ge=1, le=10_000)
-        max_runtime_ms: int = Field(default=120_000, ge=1_000, le=3_600_000)
-        budget_limit: int = Field(default=100_000, ge=1_000, le=10_000_000)
-        response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
-
-    class RunReplInput(BaseModel):
-        model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-        session_id: str = Field(..., min_length=1, description="Session id from rlm_init_context.")
-        code: str = Field(..., min_length=1, max_length=50_000, description="Python code snippet to execute.")
-        response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
-
-    class GetVarInput(BaseModel):
-        model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-        session_id: str = Field(..., min_length=1)
-        var_name: str = Field(..., min_length=1, max_length=256)
-        response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
-
-    class FinalizeInput(BaseModel):
-        model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-        session_id: str = Field(..., min_length=1)
-        final_text: str | None = Field(default=None)
-        final_var_name: str | None = Field(default=None, min_length=1, max_length=256)
-        response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
-
-        @model_validator(mode="after")
-        def validate_finalize_payload(self) -> "FinalizeInput":
-            if self.final_text is None and self.final_var_name is None:
-                raise ValueError("either final_text or final_var_name must be provided")
-            return self
-
-    class GetTraceInput(BaseModel):
-        model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-        session_id: str = Field(..., min_length=1)
-        from_step: int | None = Field(default=None, ge=0)
-        to_step: int | None = Field(default=None, ge=0)
-        response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
 
     server = RlmMcpServer(service)
     mcp = FastMCP("rlm_mcp")
